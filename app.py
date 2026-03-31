@@ -4,88 +4,243 @@ import numpy as np
 import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
+import shap
+import warnings
+warnings.filterwarnings("ignore")
+
+# ==================== HELPERS ====================
+
+def get_risk_level(prob):
+    if prob < 0.4:
+        return "🟢 Low Risk"
+    elif prob < 0.7:
+        return "🟡 Medium Risk"
+    else:
+        return "🔴 High Risk"
+
+def get_card_color(prob):
+    if prob < 0.4:
+        return "#16a34a"
+    elif prob < 0.7:
+        return "#eab308"
+    else:
+        return "#dc2626"
+
+# ==================== PAGE ====================
 
 st.set_page_config(page_title="Student Risk Predictor", layout="wide")
 
 st.title("🎓 Student Dropout Risk Prediction System")
+st.markdown("AI-powered insights to identify at-risk students")
 
-# Load trained model
-model = joblib.load("models/xgb_model.pkl")
+# ==================== SIDEBAR ====================
 
-st.sidebar.header("Upload Student Dataset")
+with st.sidebar:
+    st.header("📁 Upload Dataset")
 
-uploaded_file = st.sidebar.file_uploader(
-    "Upload CSV file with student features",
-    type=["csv"]
-)
+    uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+
+    threshold = st.slider("Risk Threshold", 0.3, 0.9, 0.5, 0.05)
+
+    st.divider()
+
+    show_shap = st.checkbox("Enable SHAP Explainability", value=True)
+
+    sample_size = st.slider("SHAP Sample Size", 50, 300, 100)
+
+# ==================== MAIN ====================
 
 if uploaded_file is not None:
-    data = pd.read_csv(uploaded_file)
+    try:
+        # -------- LOAD --------
+        data = pd.read_csv(uploaded_file)
 
-    st.subheader("Uploaded Data Preview")
-    st.dataframe(data.head())
+        model = joblib.load("models/xgb_model.pkl")
+        feature_cols = joblib.load("models/feature_columns.pk1")  # change if needed
 
-    # Load training feature list
-    feature_cols = joblib.load("models/feature_columns.pk1")
+        # -------- VALIDATE --------
+        missing = set(feature_cols) - set(data.columns)
+        if missing:
+            st.error(f"Missing features: {missing}")
+            st.stop()
 
-# Keep only training features (ignore extra columns automatically)
-    X = data[feature_cols].copy()
-    # ---------------- Prediction ----------------
-    preds = model.predict(X)
-    probs = model.predict_proba(X)[:, 1]
+        X = data[feature_cols].copy()
 
-    data["Predicted Risk"] = preds
-    data["Risk Probability"] = probs
-    data["Risk Label"] = data["Predicted Risk"].map({0: "Safe", 1: "At Risk"})
+        # -------- PREDICT --------
+        probs = model.predict_proba(X)[:, 1]
+        preds = (probs > threshold).astype(int)
 
-    st.subheader("Prediction Results")
-    st.dataframe(data)
+        data["Risk Probability"] = probs
+        data["Risk Level"] = [get_risk_level(p) for p in probs]
 
-    # ---------------- Risk Distribution ----------------
-    st.subheader("Risk Distribution")
+        # -------- METRICS --------
+        st.subheader("📊 Overview")
 
-    fig1, ax1 = plt.subplots()
-    data["Risk Label"].value_counts().plot(kind="bar", ax=ax1, color=["green", "red"])
-    ax1.set_xlabel("Risk Category")
-    ax1.set_ylabel("Number of Students")
-    st.pyplot(fig1)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Students", len(data))
+        col2.metric("At Risk", int((preds == 1).sum()))
+        col3.metric("Avg Risk", round(probs.mean(), 3))
 
-    # ---------------- Risk Probability Histogram ----------------
-    st.subheader("Risk Probability Distribution")
+        st.write(f"🔧 Current Threshold: {threshold}")
 
-    fig2, ax2 = plt.subplots()
-    sns.histplot(data["Risk Probability"], bins=20, kde=True, ax=ax2)
-    ax2.set_xlabel("Risk Probability")
-    st.pyplot(fig2)
+        st.divider()
 
-    # ---------------- Average Risk Metric ----------------
-    st.metric("Average Risk Probability", round(data["Risk Probability"].mean(), 3))
+        # -------- DISTRIBUTION --------
+        col1, col2 = st.columns(2)
 
-    # ---------------- Feature Importance ----------------
-    st.subheader("Top Features Influencing Risk")
+        with col1:
+            fig, ax = plt.subplots()
+            pd.Series(preds).value_counts().plot(kind="bar", ax=ax)
+            st.pyplot(fig)
+            plt.close()
 
-    importances = model.feature_importances_
-    feature_names = X.columns
+        with col2:
+            fig, ax = plt.subplots()
+            ax.hist(probs, bins=20)
+            st.pyplot(fig)
+            plt.close()
 
-    feat_df = pd.DataFrame({
-        "Feature": feature_names,
-        "Importance": importances
-    }).sort_values(by="Importance", ascending=False).head(10)
+        st.divider()
 
-    fig3, ax3 = plt.subplots()
-    sns.barplot(x="Importance", y="Feature", data=feat_df, ax=ax3)
-    st.pyplot(fig3)
+        # -------- FEATURE IMPORTANCE --------
+        st.subheader("📈 Feature Importance")
 
-    # ---------------- Cluster vs Risk (if cluster present) ----------------
-    if "cluster_label" in data.columns:
-        st.subheader("Cluster vs Risk Distribution")
+        feat_df = pd.DataFrame({
+            "Feature": feature_cols,
+            "Importance": model.feature_importances_
+        }).sort_values(by="Importance", ascending=False).head(10)
 
-        cluster_risk = pd.crosstab(data["cluster_label"], data["Risk Label"])
+        fig, ax = plt.subplots()
+        sns.barplot(data=feat_df, x="Importance", y="Feature", ax=ax)
+        st.pyplot(fig)
+        plt.close()
 
-        fig4, ax4 = plt.subplots()
-        cluster_risk.plot(kind="bar", stacked=True, ax=ax4)
-        ax4.set_ylabel("Number of Students")
-        st.pyplot(fig4)
+        st.divider()
+
+        # ==================== SHAP ====================
+        if show_shap:
+            st.subheader("🔍 SHAP Explainability")
+
+            size = min(sample_size, len(X))
+            idx = np.random.choice(len(X), size, replace=False)
+            X_sample = X.iloc[idx]
+
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_sample)
+
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1]
+
+            col1, col2 = st.columns(2)
+
+            # ---- SUMMARY ----
+            with col1:
+                st.markdown("**Summary Plot**")
+                fig, ax = plt.subplots()
+                shap.summary_plot(shap_values, X_sample, show=False)
+                st.pyplot(fig)
+                plt.close()
+
+            # ---- DEPENDENCE ----
+            with col2:
+                st.markdown("**Dependence Plot**")
+                feature = st.selectbox("Select Feature", X_sample.columns)
+
+                fig, ax = plt.subplots()
+                shap.dependence_plot(feature, shap_values, X_sample, ax=ax, show=False)
+                st.pyplot(fig)
+                plt.close()
+
+            st.divider()
+
+            # ---- INDIVIDUAL ----
+            st.markdown("### 📌 Individual Student Analysis")
+
+            i = st.slider("Select Student", 0, len(X_sample) - 1, 0)
+
+            expected_value = explainer.expected_value
+            if isinstance(expected_value, list):
+                expected_value = expected_value[1]
+
+            # ---- CARD ----
+            prob = probs[idx][i]
+            color = get_card_color(prob)
+
+            st.markdown(f"""
+            <div style="
+                background-color: {color};
+                padding: 15px;
+                border-radius: 10px;
+                color: white;
+                font-weight: bold;
+            ">
+                Student ID: {idx[i]} <br>
+                Risk Probability: {prob:.3f}
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ---- WATERFALL ----
+            fig, ax = plt.subplots(figsize=(10, 5))
+            shap.plots.waterfall(
+                shap.Explanation(
+                    values=shap_values[i],
+                    base_values=expected_value,
+                    data=X_sample.iloc[i],
+                    feature_names=X_sample.columns
+                ),
+                show=False
+            )
+            st.pyplot(fig)
+            plt.close()
+
+            # ---- WHY ----
+            st.markdown("### 📌 Why this student is at risk")
+
+            top_features = np.argsort(np.abs(shap_values[i]))[-3:][::-1]
+
+            for f in top_features:
+                name = X_sample.columns[f]
+                value = X_sample.iloc[i][name]
+                impact = shap_values[i][f]
+
+                if impact > 0:
+                    st.write(f"🔴 {name} ({value:.2f}) is increasing risk")
+                else:
+                    st.write(f"🟢 {name} ({value:.2f}) is reducing risk")
+
+            # ---- INTERVENTIONS ----
+            st.markdown("### 🛠 Suggested Interventions")
+
+            for f in top_features:
+                name = X_sample.columns[f]
+                impact = shap_values[i][f]
+
+                if impact > 0:
+                    if "content" in name or "homepage" in name:
+                        st.write("📘 Increase engagement with learning materials")
+                    elif "quiz" in name:
+                        st.write("📝 Provide more quiz practice")
+                    elif "forum" in name:
+                        st.write("💬 Encourage discussion participation")
+                    else:
+                        st.write(f"⚠️ Improve performance in {name}")
+
+            # ---- STATUS ----
+            if prob > 0.7:
+                st.warning("⚠️ High intervention required")
+            elif prob > 0.4:
+                st.info("📊 Monitor student closely")
+            else:
+                st.success("✅ Student performing well")
+
+        st.divider()
+
+        # -------- RESULTS --------
+        st.subheader("📋 Results")
+        st.dataframe(data.head(20))
+
+    except Exception as e:
+        st.error(f"Error: {e}")
 
 else:
-    st.info("Upload a CSV file to start prediction")
+    st.info("Upload a CSV file to start")
